@@ -1,159 +1,137 @@
+/**
+ * PROJET : Jellycat Tracker Automatisé
+ * AUTEUR : Alexandra Bouffard 
+ * DESCRIPTION : Surveille plusieurs boutiques Shopify pour détecter les nouveaux produits Jellycat
+ * et envoie des notifications en temps réel via un Webhook Discord.
+ */
+
 import fetch from "node-fetch";
 import fs from "fs";
-import "dotenv/config";
+import "dotenv/config"; 
 
-const DATA_FILE = "./data/products.json";
-const WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+// --- CONFIGURATION GLOBALE ---
+const CONFIG = {
+  DATA_FILE: "./data/products.json", // Fichier de stockage pour la persistance des données
+  WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL, // URL secrète récupérée depuis le fichier .env
+  CHECK_INTERVAL: 10 * 60 * 1000, // Fréquence de vérification (10 minutes)
+  SITES: [
+    { name: "Kitsch", jsonUrl: "https://kitschalos.com/collections/jellycat/products.json", baseUrl: "https://kitschalos.com/products/" },
+    { name: "Chat Perché", jsonUrl: "https://chatperche.ca/collections/jelly-cat/products.json", baseUrl: "https://chatperche.ca/products/" },
+    { name: "Clément", jsonUrl: "https://clement.ca/collections/jellycat/products.json", baseUrl: "https://clement.ca/products/" },
+    { name: "Billie Le Kid", jsonUrl: "https://www.billielekid.com/collections/jellycat/products.json", baseUrl: "https://www.billielekid.com/products/" },
+    { name: "Momease", jsonUrl: "https://www.momease.ca/collections/jellycat/products.json", baseUrl: "https://www.momease.ca/products/" },
+    { name: "Crocus & Ivy", jsonUrl: "https://www.crocusandivy.ca/collections/jellycat-plush-toys/products.json", baseUrl: "https://www.crocusandivy.ca/products/" },
+    { name: "Veille sur toi", jsonUrl: "https://veillesurtoi.com/collections/jellycat/products.json", baseUrl: "https://veillesurtoi.com/products/" }
+  ]
+};
 
-// tableau des sites
-const SITES = [
-  {
-    name: "Kitschalos",
-    jsonUrl: "https://kitschalos.com/collections/jellycat/products.json",
-    baseUrl: "https://kitschalos.com/products/"
-  },
-  {
-    name: "Chat Perché",
-    jsonUrl: "https://chatperche.ca/collections/jelly-cat/products.json",
-    baseUrl: "https://chatperche.ca/products/"
-  },
-  {
-    name: "Clément",
-    jsonUrl: "https://clement.ca/collections/baby-gear-for-baby-plush-toys/products.json",
-    baseUrl: "https://clement.ca/products/"
-  },
-  {
-    name: "Billie Le Kid",
-    jsonUrl: "https://www.billielekid.com/collections/jellycat/products.json",
-    baseUrl: "https://www.billielekid.com/products/"
-  }
-];
-
-// Fonction pour récupérer les produits d'un seul site
+/**
+ * Récupère les produits d'un site spécifique via son API JSON Shopify.
+ * @param {Object} site - L'objet contenant les informations du site (nom, url).
+ * @returns {Promise<Array>} Liste d'objets produits formatés.
+ */
 async function fetchProductsFromSite(site) {
-  let siteProducts = [];
-  let page = 1;
-  let keepGoing = true;
-
-  console.log(`Vérification de ${site.name}...`);
-
   try {
-    while (keepGoing) {
-      // demande 250 produits par page pour aller plus vite
-      const res = await fetch(`${site.jsonUrl}?page=${page}&limit=250`);
-      if (!res.ok) throw new Error(`Erreur HTTP : ${res.status}`);
-      const data = await res.json();
+    // On demande 250 produits pour couvrir tout l'inventaire en une requête
+    const res = await fetch(`${site.jsonUrl}?limit=250`);
+    if (!res.ok) throw new Error(`Status HTTP: ${res.status}`);
+    
+    const data = await res.json();
 
-      if (!data.products || data.products.length === 0) {
-        keepGoing = false;
-        break;
-      }
-
-      // filtrage et formatage
-      const cleanProducts = data.products
-        .filter(p => {
-          // extra sécurité pour Clément : on s'assure que c'est bien des Jellycat
-          if (p.vendor && p.vendor.toLowerCase().includes("jellycat")) return true;
-          // si le site est 100% Jellycat on prend tout
-          if (site.name !== "Clément") return true; 
-          return false;
-        })
-        .map(p => ({
-          name: p.title,
-          link: site.baseUrl + p.handle,
-          siteName: site.name // ajoute le nom du site pour Discord
-        }));
-
-      siteProducts = siteProducts.concat(cleanProducts);
-      page++;
-    }
+    return (data.products || [])
+      .filter(p => {
+        // Filtrage de sécurité : on s'assure que le fabricant est bien Jellycat (ex : Clément)
+        const vendor = p.vendor ? p.vendor.toLowerCase() : "";
+        return site.name !== "Clément" || vendor.includes("jellycat");
+      })
+      .map(p => ({
+        id: p.id,
+        name: p.title,
+        link: site.baseUrl + p.handle,
+        siteName: site.name,
+        updated_at: p.updated_at
+      }));
   } catch (error) {
-    console.error(`Erreur sur ${site.name}:`, error.message);
+    console.error(`[${site.name}] Erreur de récupération: ${error.message}`);
+    return []; // On retourne un tableau vide pour ne pas bloquer les autres sites
   }
-
-  return siteProducts;
 }
 
-// récupérer TOUS les produits de TOUS les sites
-async function fetchAllProducts() {
-  let allProducts = [];
-  
-  for (const site of SITES) {
-    const p = await fetchProductsFromSite(site);
-    allProducts = allProducts.concat(p);
+/**
+ * Gère la lecture et l'écriture des données sur le disque.
+ * Utile pour comparer les produits entre deux scans.
+ */
+const DataManager = {
+  load: () => {
+    if (!fs.existsSync(CONFIG.DATA_FILE)) return [];
+    try {
+      return JSON.parse(fs.readFileSync(CONFIG.DATA_FILE));
+    } catch (e) { return []; }
+  },
+  save: (data) => {
+    if (!fs.existsSync("./data")) fs.mkdirSync("./data", { recursive: true });
+    fs.writeFileSync(CONFIG.DATA_FILE, JSON.stringify(data, null, 2));
   }
+};
 
-  console.log("Total global produits récupérés :", allProducts.length);
-  return allProducts;
-}
+/**
+ * Prépare et envoie le message de notification à Discord.
+ * @param {Array} newItems - Liste des nouveaux produits détectés.
+ */
+async function sendNotification(newItems) {
+  if (newItems.length === 0) return;
 
-// charger les anciens produits
-function loadOldProducts() {
-  if (!fs.existsSync(DATA_FILE)) return [];
-  return JSON.parse(fs.readFileSync(DATA_FILE));
-}
+  // On limite à 10 produits par message pour éviter de dépasser la limite de caractères de Discord
+  const chunks = newItems.slice(0, 10);
+  const content = "🧸 **ALERTE : NOUVEAUX JELLYCATS DÉTECTÉS !**\n\n" + 
+                  chunks.map(p => `• **${p.name}**\n📍 *Source : ${p.siteName}*\n🔗 ${p.link}`).join("\n\n");
 
-// sauvegarder les produits
-function saveProducts(products) {
-  if (!fs.existsSync("./data")) fs.mkdirSync("./data");
-  fs.writeFileSync(DATA_FILE, JSON.stringify(products, null, 2));
-}
-
-// envoyer notification Discord
-async function notifyDiscord(newProducts) {
-  // coupe le message s'il y a trop de produits pour éviter l'erreur Discord
-  const productsToSend = newProducts.slice(0, 10); 
-  
-  const message =
-    "🧸 **NOUVEAUX JELLYCATS DÉTECTÉS !**\n\n" +
-    productsToSend.map(p => `• **${p.name}**\n📍 *${p.siteName}*\n${p.link}`).join("\n\n");
-
-  if (newProducts.length > 10) {
-     // petit message si on a coupé la liste
-     message += `\n\n... et ${newProducts.length - 10} autres !`;
-  }
-
-  await fetch(WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content: message })
-  });
-}
-
-// vérification
-async function checkDrops() {
   try {
-    const currentProducts = await fetchAllProducts();
-    const oldProducts = loadOldProducts();
-
-    // compare les liens 
-    const newOnes = currentProducts.filter(
-      p => !oldProducts.some(op => op.link === p.link)
-    );
-
-    if (newOnes.length > 0) {
-      console.log(`🚨 ${newOnes.length} Nouveaux produits trouvés !`);
-      
-      const isFirstRunOrMassive = oldProducts.length === 0 || newOnes.length > 50;
-      
-      if (!isFirstRunOrMassive) {
-          await notifyDiscord(newOnes);
-      } else {
-          console.log("Trop de nouveaux produits d'un coup (initialisation), pas de notif Discord.");
-      }
-
-    } else {
-      console.log("Pas de nouveau produit pour l'instant.");
-    }
-
-    saveProducts(currentProducts);
+    await fetch(CONFIG.WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content })
+    });
   } catch (err) {
-    console.error("Erreur globale lors du check :", err);
+    console.error("Erreur lors de l'envoi Discord:", err);
   }
 }
 
-checkDrops(); 
+/**
+ * Logique principale : Orchestre le scan, la comparaison et la sauvegarde
+ */
+async function main() {
+  console.log(`\n[${new Date().toLocaleTimeString()}] Début du scan sur ${CONFIG.SITES.length} sites...`);
+  
+  // Exécution asynchrone parallèle : tous les sites sont scannés en même temps
+  const results = await Promise.all(CONFIG.SITES.map(s => fetchProductsFromSite(s)));
+  
+  // Fusionne tous les tableaux de produits en un seul
+  const currentProducts = results.flat();
+  const oldProducts = DataManager.load();
 
-setInterval(() => {
-  checkDrops();
-}, 10 * 60 * 1000); // regarde site chaque 10 minutes
+  // Détection des nouveautés : on regarde si le lien existe déjà dans l'ancienne liste
+  const newItems = currentProducts.filter(p => !oldProducts.some(op => op.link === p.link));
+
+  if (newItems.length > 0) {
+    // Sécurité : Si le fichier était vide ou s'il y a trop de produits (>50), on ne notifie pas (initialisation)
+    const isFirstRun = oldProducts.length === 0;
+    const isMassiveDrop = newItems.length > 50;
+
+    if (!isFirstRun && !isMassiveDrop) {
+      await sendNotification(newItems);
+      console.log(`🚨 ${newItems.length} nouveautés trouvées et envoyées !`);
+    } else {
+      console.log(`📦 Initialisation : ${newItems.length} produits ajoutés à la base de données.`);
+    }
+  } else {
+    console.log("✅ Scan terminé : Aucun nouveau produit.");
+  }
+
+  // Persistance des données pour le prochain cycle
+  DataManager.save(currentProducts);
+}
+
+// --- INITIALISATION ---
+main(); // Exécution immédiate au lancement
+setInterval(main, CONFIG.CHECK_INTERVAL); // Planification récurrente
